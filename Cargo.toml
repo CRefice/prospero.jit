@@ -1,0 +1,8 @@
+[package]
+name = "prospero"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+image = {version = "0.25.6", features = ["png"]}
+libc = "0.2.171"

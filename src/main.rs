@@ -1,5 +1,9 @@
+#[cfg(not(target_feature = "avx"))]
+compile_error!("AVX is required for this project");
+
 mod codegen;
 
+use codegen::{CodeBuffer, Ymm};
 use std::fs::File;
 use std::io::BufReader;
 use std::io::prelude::*;
@@ -110,13 +114,6 @@ impl Instr {
             _ => None,
         }
     }
-
-    fn as_unary(&self) -> Option<OperandId> {
-        match self {
-            Instr::Neg(x) | Instr::Sqrt(x) => Some(*x),
-            _ => None,
-        }
-    }
 }
 
 pub fn compute_last_usage(instrs: &[Instr]) -> Vec<OperandId> {
@@ -129,9 +126,7 @@ pub fn compute_last_usage(instrs: &[Instr]) -> Vec<OperandId> {
     uses
 }
 
-// Ensures proper alignment for AVX
-#[repr(align(32))]
-struct Align32<T>(T);
+const IMAGE_SIZE: usize = 4096;
 
 fn main() {
     let path = std::env::args().nth(1).expect("No argument provided");
@@ -156,13 +151,11 @@ fn main() {
     let constants = parser.constants;
 
     let timer = Instant::now();
-    let mut buf = codegen::CodeBuffer::default();
+    let mut buf = CodeBuffer::default();
     codegen::generate_code(&mut buf, &instrs);
     eprintln!("Compiled code in: {:?}", timer.elapsed());
 
     let code = buf.install();
-
-    const IMAGE_SIZE: usize = 4096;
 
     fn to_unit_rect(i: usize) -> f32 {
         let i = i as isize;
@@ -178,7 +171,7 @@ fn main() {
         _mm256_div_ps(offsets, dividend)
     };
 
-    fn to_image_bytes(x: __m256) -> [u8; 8] {
+    fn to_image_bytes(x: Ymm) -> [u8; 8] {
         unsafe {
             let mask = _mm256_cmp_ps::<_CMP_GT_OQ>(x, _mm256_setzero_ps());
             let ones = _mm256_set1_ps(255.0);
@@ -217,6 +210,7 @@ fn main() {
         IMAGE_SIZE as u32,
         IMAGE_SIZE as u32,
         image::ColorType::L8,
-    );
+    )
+    .expect("Could not save image");
     eprintln!("Saved image to image.png");
 }

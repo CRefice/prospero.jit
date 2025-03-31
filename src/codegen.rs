@@ -222,7 +222,6 @@ impl CodeBuffer {
 
             InstalledCode {
                 buf: ptr,
-                //
                 code_size: self.buf.len(),
                 layout,
                 temp_buf,
@@ -314,6 +313,15 @@ pub struct InstalledCode {
     temp_buf: Vec<Ymm>,
 }
 
+impl Drop for InstalledCode {
+    fn drop(&mut self) {
+        use std::alloc;
+        unsafe {
+            alloc::dealloc(self.buf, self.layout);
+        }
+    }
+}
+
 pub type Ymm = std::arch::x86_64::__m256;
 
 impl InstalledCode {
@@ -322,13 +330,12 @@ impl InstalledCode {
     }
 
     pub fn invoke(&self, x: Ymm, y: Ymm, constants: &[f32]) -> Ymm {
-        type JitFn = extern "C" fn(Ymm, Ymm) -> Ymm;
         unsafe {
-            let f: JitFn = std::mem::transmute(self.buf);
+            let fn_ptr = self.buf;
             let result: Ymm;
             std::arch::asm!(
                 "call {}",
-                in(reg) f,
+                in(reg) fn_ptr,
                 in("rax") constants.as_ptr(),
                 in("rcx") self.temp_buf.as_ptr(),
                 inout("ymm0") x => result,

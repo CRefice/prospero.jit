@@ -1,3 +1,4 @@
+use crate::{Instr, OperandId};
 use std::alloc::{self, Layout};
 use std::collections::BTreeSet;
 
@@ -131,8 +132,8 @@ impl CodeBuffer {
     }
 
     const SCRATCH: Operand = Operand::Reg(15);
-    const CONSTANT_BASE: Operand = Operand::Reg(0);
-    const TEMP_BASE: Operand = Operand::Reg(1);
+    const RAX: u8 = 0;
+    const RCX: u8 = 1;
 
     pub fn binary(&mut self, instr: &Instr, dest: u8, values: &[Operand]) {
         let (x, y) = instr.as_binary().expect("Not a binary instruction");
@@ -162,7 +163,7 @@ impl CodeBuffer {
                 self.broadcast(
                     dest,
                     Operand::Memory {
-                        base: Self::CONSTANT_BASE.register(),
+                        base: Self::RAX,
                         disp: *disp * std::mem::size_of::<f32>() as u32,
                     },
                 );
@@ -182,17 +183,6 @@ impl CodeBuffer {
     }
 
     const VALUE_SIZE: u32 = std::mem::size_of::<Ymm>() as u32;
-
-    pub fn spill(&mut self, reg: u8) -> Operand {
-        let stack_slot = Operand::Memory {
-            base: CodeBuffer::TEMP_BASE.register(),
-            disp: self.stack_size * Self::VALUE_SIZE,
-        };
-        self.stack_size += 1;
-
-        self.mov(stack_slot, Operand::Reg(reg));
-        stack_slot
-    }
 
     pub fn install(self) -> InstalledCode {
         use libc::{_SC_PAGESIZE, sysconf};
@@ -222,7 +212,6 @@ impl CodeBuffer {
 
             InstalledCode {
                 buf: ptr,
-                code_size: self.buf.len(),
                 layout,
                 temp_buf,
             }
@@ -230,85 +219,166 @@ impl CodeBuffer {
     }
 }
 
-use crate::{Instr, OperandId};
-pub fn generate_code(buf: &mut CodeBuffer, instrs: &[Instr]) {
-    #[derive(Default, Debug, Clone, Copy, PartialOrd, Ord, PartialEq, Eq)]
-    struct LiveInterval {
-        // exclusive
-        end: OperandId,
-        // inclusive
-        start: OperandId,
+#[derive(Default, Debug, Clone, Copy, PartialOrd, Ord, PartialEq, Eq)]
+struct LiveInterval {
+    // exclusive
+    end: OperandId,
+    // inclusive
+    start: OperandId,
+}
+
+struct RegisterAllocator {
+    assigned: Vec<Operand>,
+
+    active_regs: BTreeSet<LiveInterval>,
+    available_regs: Vec<u8>,
+
+    active_mem: BTreeSet<LiveInterval>,
+    available_mem: Vec<u32>,
+    stack_size: u32,
+}
+
+impl RegisterAllocator {
+    fn new(instrs: &[Instr]) -> Self {
+        Self {
+            assigned: Vec::with_capacity(instrs.len()),
+            active_regs: BTreeSet::new(),
+            // ymm0 and ymm1 are occupied by params
+            // keep ymm15 as scratch register for spilled values
+            available_regs: (2..15).rev().collect(),
+            active_mem: BTreeSet::new(),
+            available_mem: Vec::new(),
+            stack_size: 0,
+        }
     }
 
-    let ends = crate::compute_last_usage(instrs);
-
-    let mut active: BTreeSet<LiveInterval> = BTreeSet::new();
-
-    // ymm0 and ymm1 are occupied by params
-    // keep ymm15 as scratch register for spilled values
-    let mut available_regs: Vec<u8> = (2..15).rev().collect();
-
-    let mut locations: Vec<Operand> = Vec::new();
-
-    let Some((last, instrs)) = instrs.split_last() else {
-        // No need to do anything if there are no instructions
-        return;
-    };
-    for (i, instr) in instrs.iter().enumerate() {
-        let id = OperandId(i as u32);
-        let end = ends[i];
-
+    fn free_dead_values(&mut self, cur: OperandId) {
         // Make unused registers available
-        while let Some(i) = active.first().copied() {
-            if i.end > id {
+        while let Some(i) = self.active_regs.first().copied() {
+            if i.end > cur {
                 break;
             }
-            active.pop_first();
-            let Operand::Reg(reg) = locations[i.start.0 as usize] else {
-                unreachable!("active value location can only be register: {:?}", i);
-            };
-            available_regs.push(reg);
+            self.active_regs.pop_first();
+            match self.assigned[i.start.0 as usize] {
+                Operand::Reg(reg) => self.available_regs.push(reg),
+                _ => unreachable!(),
+            }
         }
 
-        if let Instr::Var(reg) = instr {
-            locations.push(Operand::Reg(*reg as u8));
-            // No need to generate anything, arguments are already stored in registers
-            // at the beginning of the function
-            active.insert(LiveInterval { end, start: id });
-        } else if let Some(reg) = available_regs.pop() {
-            buf.instruction(instr, reg, &locations);
-            locations.push(Operand::Reg(reg));
-            active.insert(LiveInterval { end, start: id });
-        } else {
-            let candidate = active.last().expect("There's no live value topispill");
-            let candidate_id = candidate.start.0 as usize;
-            if candidate.end > end {
-                let loc @ Operand::Reg(reg) = locations[candidate_id] else {
-                    unreachable!("Cannot spill from memory");
-                };
-
-                locations[candidate_id] = buf.spill(reg);
-                active.pop_last();
-
-                buf.instruction(instr, reg, &locations);
-                locations.push(loc);
-                active.insert(LiveInterval { end, start: id });
-            } else {
-                let scratch = CodeBuffer::SCRATCH.register();
-                buf.instruction(instr, scratch, &locations);
-                locations.push(buf.spill(scratch));
+        while let Some(i) = self.active_mem.first().copied() {
+            if i.end > cur {
+                break;
+            }
+            self.active_mem.pop_first();
+            match self.assigned[i.start.0 as usize] {
+                Operand::Memory { disp, .. } => self.available_mem.push(disp),
+                _ => unreachable!(),
             }
         }
     }
-    // Last element is the returned value, so it must go in ymm0
-    buf.instruction(last, 0, &locations);
 
-    eprintln!("Spilled {} variables to memory", buf.stack_size);
+    fn assign_register(&mut self, reg: u8, interval: LiveInterval) {
+        self.assigned.push(Operand::Reg(reg));
+        self.active_regs.insert(interval);
+    }
+
+    fn assign_memory(&mut self, operand: Operand, interval: LiveInterval) {
+        self.assigned.push(operand);
+        self.active_mem.insert(interval);
+    }
+
+    fn pop_stack_slot(&mut self) -> Operand {
+        let disp = self.available_mem.pop().unwrap_or_else(|| {
+            let slot = self.stack_size;
+            self.stack_size += 1;
+            slot * CodeBuffer::VALUE_SIZE
+        });
+        Operand::Memory {
+            base: CodeBuffer::RCX,
+            disp,
+        }
+    }
+
+    fn spill(&mut self, val: LiveInterval) -> (u8, Operand) {
+        let i = val.start.0 as usize;
+        let Operand::Reg(reg) = self.assigned[i] else {
+            panic!("Cannot spill a memory location: {:?}", self.assigned[i]);
+        };
+
+        let new_loc = self.pop_stack_slot();
+        self.assigned[i] = new_loc;
+        self.active_mem.insert(val);
+        (reg, new_loc)
+    }
+
+    fn generate_code(&mut self, buf: &mut CodeBuffer, instrs: &[Instr]) {
+        let ends = crate::compute_last_usage(instrs);
+
+        let Some((last, instrs)) = instrs.split_last() else {
+            // No need to do anything if there are no instructions
+            return;
+        };
+
+        let mut num_spills = 0;
+
+        for (i, instr) in instrs.iter().enumerate() {
+            let interval = LiveInterval {
+                end: ends[i],
+                start: OperandId(i as u32),
+            };
+
+            self.free_dead_values(interval.start);
+
+            if let Instr::Var(reg) = instr {
+                // No need to generate anything, arguments are already stored in registers
+                // at the beginning of the function
+                self.assign_register(*reg as u8, interval);
+            } else if let Some(reg) = self.available_regs.pop() {
+                buf.instruction(instr, reg, &self.assigned);
+                self.assign_register(reg, interval);
+            } else {
+                // Need to spill something
+                num_spills += 1;
+
+                let candidate = self
+                    .active_regs
+                    .last()
+                    .copied()
+                    .expect("There's no live value to spill");
+
+                if candidate.end > interval.end {
+                    self.active_regs.pop_last();
+
+                    let (reg, mem) = self.spill(candidate);
+                    buf.mov(mem, Operand::Reg(reg));
+                    buf.instruction(instr, reg, &self.assigned);
+                    self.assign_register(reg, interval);
+                } else {
+                    let scratch = CodeBuffer::SCRATCH;
+                    buf.instruction(instr, scratch.register(), &self.assigned);
+                    let mem = self.pop_stack_slot();
+                    buf.mov(mem, scratch);
+                    self.assign_memory(mem, interval);
+                }
+            }
+        }
+        // Last element is the returned value, so it must go in ymm0
+        buf.instruction(last, 0, &self.assigned);
+
+        buf.stack_size = self.stack_size;
+        eprintln!(
+            "Spilled {} variables in {} slots of memory",
+            num_spills, self.stack_size
+        );
+    }
+}
+
+pub fn generate_code(buf: &mut CodeBuffer, instrs: &[Instr]) {
+    RegisterAllocator::new(instrs).generate_code(buf, instrs);
 }
 
 pub struct InstalledCode {
     buf: *mut u8,
-    code_size: usize,
     layout: Layout,
     temp_buf: Vec<Ymm>,
 }
@@ -325,10 +395,6 @@ impl Drop for InstalledCode {
 pub type Ymm = std::arch::x86_64::__m256;
 
 impl InstalledCode {
-    pub fn code(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.buf, self.code_size) }
-    }
-
     pub fn invoke(&self, x: Ymm, y: Ymm, constants: &[f32]) -> Ymm {
         unsafe {
             let fn_ptr = self.buf;

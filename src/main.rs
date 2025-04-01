@@ -126,10 +126,13 @@ pub fn compute_last_usage(instrs: &[Instr]) -> Vec<OperandId> {
     uses
 }
 
-const IMAGE_SIZE: usize = 4096;
-
 fn main() {
     let path = std::env::args().nth(1).expect("No argument provided");
+    let image_size = std::env::args()
+        .nth(2)
+        .expect("Image size required")
+        .parse()
+        .expect("Could not parse image size");
 
     let file = File::open(path).expect("Could not open input file");
     let file = BufReader::new(file);
@@ -157,9 +160,9 @@ fn main() {
 
     let code = buf.install();
 
-    fn to_unit_rect(i: usize) -> f32 {
+    fn to_unit_rect(i: usize, image_size: usize) -> f32 {
         let i = i as isize;
-        let half_size = (IMAGE_SIZE / 2) as isize;
+        let half_size = (image_size / 2) as isize;
         (i - half_size) as f32 / half_size as f32
     }
 
@@ -167,7 +170,7 @@ fn main() {
 
     let offsets = unsafe {
         let offsets = _mm256_setr_ps(0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0);
-        let dividend = _mm256_set1_ps((IMAGE_SIZE / 2) as f32);
+        let dividend = _mm256_set1_ps((image_size / 2) as f32);
         _mm256_div_ps(offsets, dividend)
     };
 
@@ -186,13 +189,13 @@ fn main() {
     }
 
     let timer = Instant::now();
-    let mut image = vec![0u8; IMAGE_SIZE * IMAGE_SIZE];
-    for y in 0..IMAGE_SIZE {
-        let row = &mut image[IMAGE_SIZE * y..];
-        for x in (0..IMAGE_SIZE).step_by(8) {
+    let mut image = vec![0u8; image_size * image_size];
+    for y in 0..image_size {
+        let row = &mut image[image_size * y..];
+        for x in (0..image_size).step_by(8) {
             let chunk = &mut row[x..(x + 8)];
-            let y = to_unit_rect(IMAGE_SIZE - y);
-            let x = to_unit_rect(x);
+            let y = to_unit_rect(image_size - y, image_size);
+            let x = to_unit_rect(x, image_size);
             unsafe {
                 let y = _mm256_set1_ps(y);
                 let x = _mm256_set1_ps(x);
@@ -207,8 +210,8 @@ fn main() {
     image::save_buffer(
         Path::new("image.png"),
         &image,
-        IMAGE_SIZE as u32,
-        IMAGE_SIZE as u32,
+        image_size as u32,
+        image_size as u32,
         image::ColorType::L8,
     )
     .expect("Could not save image");

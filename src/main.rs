@@ -4,6 +4,7 @@ compile_error!("AVX is required for this project");
 mod codegen;
 
 use codegen::{CodeBuffer, Ymm};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufReader;
 use std::io::prelude::*;
@@ -11,31 +12,77 @@ use std::path::Path;
 use std::time::Instant;
 
 #[derive(Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Clone, Copy, Default)]
-pub struct OperandId(u32);
+pub struct VarId(u32);
 
-impl OperandId {
+impl VarId {
     fn parse(label: &str) -> Self {
         debug_assert!(label.starts_with('_'), "Must start with _: {}", label);
         let id = u32::from_str_radix(&label[1..], 16).expect("Could not parse label");
-        OperandId(id)
+        VarId(id)
     }
 }
 
-#[derive(Debug)]
-pub enum Instr {
+#[derive(Debug, Clone, Copy)]
+enum UnaryOpcode {
+    Neg,
+    Sqrt,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum BinaryOpcode {
+    Add,
+    Sub,
+    Mul,
+    Max,
+    Min,
+}
+
+#[derive(Clone)]
+enum Instr {
     Var(u32),
     Const(u32),
-    Add(OperandId, OperandId),
-    Sub(OperandId, OperandId),
-    Mul(OperandId, OperandId),
-    Max(OperandId, OperandId),
-    Min(OperandId, OperandId),
-    Neg(OperandId),
-    Sqrt(OperandId),
+    Unary {
+        op: UnaryOpcode,
+        operand: VarId,
+    },
+    Binary {
+        op: BinaryOpcode,
+        lhs: VarId,
+        rhs: VarId,
+    },
+}
+
+impl std::fmt::Debug for Instr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Instr::Var(i) => write!(f, "var-{}", i),
+            Instr::Const(_) => write!(f, "const"),
+            Instr::Unary { op, operand } => {
+                let op = match op {
+                    UnaryOpcode::Neg => "neg",
+                    UnaryOpcode::Sqrt => "sqrt",
+                };
+                write!(f, "{} {}", op, operand.0)
+            }
+            Instr::Binary { op, lhs, rhs } => {
+                let op = match op {
+                    BinaryOpcode::Mul if lhs == rhs => {
+                        return write!(f, "square {}", lhs.0);
+                    }
+                    BinaryOpcode::Add => "add",
+                    BinaryOpcode::Sub => "sub",
+                    BinaryOpcode::Mul => "mul",
+                    BinaryOpcode::Max => "max",
+                    BinaryOpcode::Min => "min",
+                };
+                write!(f, "{} {} {}", op, lhs.0, rhs.0)
+            }
+        }
+    }
 }
 
 #[derive(Default)]
-pub struct Parser {
+struct Parser {
     constants: Vec<f32>,
     param_count: u32,
 }
@@ -59,71 +106,220 @@ impl Parser {
                 instr
             }
             "neg" => {
-                let val = OperandId::parse(it.next().expect("Operand must be present"));
-                Instr::Neg(val)
+                let operand = VarId::parse(it.next().expect("Operand must be present"));
+                Instr::Unary {
+                    op: UnaryOpcode::Neg,
+                    operand,
+                }
             }
             "square" => {
-                let val = OperandId::parse(it.next().expect("Operand must be present"));
-                Instr::Mul(val, val)
+                let operand = VarId::parse(it.next().expect("Operand must be present"));
+                Instr::Binary {
+                    op: BinaryOpcode::Mul,
+                    lhs: operand,
+                    rhs: operand,
+                }
             }
             "sqrt" => {
-                let val = OperandId::parse(it.next().expect("Operand must be present"));
-                Instr::Sqrt(val)
+                let operand = VarId::parse(it.next().expect("Operand must be present"));
+                Instr::Unary {
+                    op: UnaryOpcode::Sqrt,
+                    operand,
+                }
             }
             x => {
-                let l = OperandId::parse(it.next().expect("Left operand must be present"));
-                let r = OperandId::parse(it.next().expect("Right operand must be present"));
-                match x {
-                    "add" => Instr::Add(l, r),
-                    "sub" => Instr::Sub(l, r),
-                    "mul" => Instr::Mul(l, r),
-                    "max" => Instr::Max(l, r),
-                    "min" => Instr::Min(l, r),
+                let lhs = VarId::parse(it.next().expect("Left operand must be present"));
+                let rhs = VarId::parse(it.next().expect("Right operand must be present"));
+                use BinaryOpcode::*;
+                let op = match x {
+                    "add" => Add,
+                    "sub" => Sub,
+                    "mul" => Mul,
+                    "max" => Max,
+                    "min" => Min,
                     x => unreachable!("Unexpected opcode: {}", x),
-                }
+                };
+                Instr::Binary { op, lhs, rhs }
             }
         }
     }
 }
 
 impl Instr {
-    fn traverse_inputs(&self, mut f: impl FnMut(OperandId)) {
+    fn traverse_inputs(&self, mut f: impl FnMut(VarId)) {
         match self {
-            Instr::Add(l, r)
-            | Instr::Sub(l, r)
-            | Instr::Mul(l, r)
-            | Instr::Max(l, r)
-            | Instr::Min(l, r) => {
-                f(*l);
-                f(*r);
+            Instr::Binary { lhs, rhs, .. } => {
+                f(*lhs);
+                f(*rhs);
             }
-            Instr::Neg(x) | Instr::Sqrt(x) => {
-                f(*x);
+            Instr::Unary { operand, .. } => {
+                f(*operand);
             }
             _ => (),
         }
     }
+}
 
-    fn as_binary(&self) -> Option<(OperandId, OperandId)> {
-        match self {
-            Instr::Add(l, r)
-            | Instr::Sub(l, r)
-            | Instr::Mul(l, r)
-            | Instr::Max(l, r)
-            | Instr::Min(l, r) => Some((*l, *r)),
-            _ => None,
+fn compute_last_usage(instrs: &[Instr]) -> Vec<VarId> {
+    let mut uses: Vec<VarId> = Vec::new();
+    uses.resize_with(instrs.len(), Default::default);
+    for (id, i) in instrs.iter().enumerate() {
+        let id = VarId(id as u32);
+        i.traverse_inputs(|input| uses[input.0 as usize] = id);
+    }
+    uses
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Range {
+    min: f32,
+    max: f32,
+}
+
+fn range_for(elems: &[f32]) -> Range {
+    let min = elems.iter().fold(f32::INFINITY, |a, &b| a.min(b));
+    let max = elems.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+    Range { min, max }
+}
+
+fn range_optimization(
+    param_ranges: [Range; 2],
+    instrs: &[Instr],
+    constants: &[f32],
+) -> HashMap<VarId, VarId> {
+    let mut ranges: Vec<Range> = Vec::new();
+    let mut replacements: HashMap<VarId, VarId> = HashMap::new();
+    for (i, instr) in instrs.iter().enumerate() {
+        let id = VarId(i as u32);
+        let range = match instr {
+            Instr::Var(x) => param_ranges[*x as usize],
+            Instr::Const(x) => Range {
+                min: constants[*x as usize],
+                max: constants[*x as usize],
+            },
+            Instr::Unary { op, operand } => {
+                let range = &ranges[operand.0 as usize];
+                match op {
+                    UnaryOpcode::Neg => Range {
+                        max: -range.min,
+                        min: -range.max,
+                    },
+                    UnaryOpcode::Sqrt => Range {
+                        min: range.min.max(0.0).sqrt(),
+                        max: range.max.sqrt(),
+                    },
+                }
+            }
+            Instr::Binary { op, lhs, rhs } => {
+                let xr = &ranges[lhs.0 as usize];
+                let yr = &ranges[rhs.0 as usize];
+                use BinaryOpcode::*;
+                match op {
+                    Add => Range {
+                        min: xr.min + yr.min,
+                        max: xr.max + yr.max,
+                    },
+                    Sub => Range {
+                        min: xr.min - yr.max,
+                        max: xr.max - yr.min,
+                    },
+                    Mul => range_for(&[
+                        xr.min * yr.min,
+                        xr.min * yr.max,
+                        xr.max * yr.min,
+                        xr.max * yr.max,
+                    ]),
+                    Max => {
+                        if xr.min > yr.max {
+                            replacements.insert(id, *lhs);
+                            *xr
+                        } else if xr.max < yr.min {
+                            replacements.insert(id, *rhs);
+                            *yr
+                        } else {
+                            Range {
+                                min: xr.min.max(yr.min),
+                                max: xr.max.max(yr.max),
+                            }
+                        }
+                    }
+                    Min => {
+                        if xr.min > yr.max {
+                            replacements.insert(id, *rhs);
+                            *yr
+                        } else if xr.max < yr.min {
+                            replacements.insert(id, *lhs);
+                            *xr
+                        } else {
+                            Range {
+                                min: xr.min.min(yr.min),
+                                max: xr.max.min(yr.max),
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        debug_assert!(range.min <= range.max, "{} <= {}", range.min, range.max);
+        ranges.push(range);
+    }
+    replacements
+}
+
+fn apply_replacements(instrs: &mut [Instr], replacements: &HashMap<VarId, VarId>) {
+    for instr in instrs.iter_mut() {
+        match instr {
+            Instr::Unary { operand, .. } => {
+                *operand = replacements.get(operand).copied().unwrap_or(*operand)
+            }
+            Instr::Binary { lhs, rhs, .. } => {
+                *lhs = replacements.get(lhs).copied().unwrap_or(*lhs);
+                *rhs = replacements.get(rhs).copied().unwrap_or(*rhs);
+            }
+            _ => (),
         }
     }
 }
 
-pub fn compute_last_usage(instrs: &[Instr]) -> Vec<OperandId> {
-    let mut uses: Vec<OperandId> = Vec::new();
-    uses.resize_with(instrs.len(), Default::default);
-    for (id, i) in instrs.iter().enumerate() {
-        let id = OperandId(id as u32);
-        i.traverse_inputs(|input| uses[input.0 as usize] = id);
+fn cleanup_unused(instrs: Vec<Instr>) -> Vec<Instr> {
+    let old_count = instrs.len();
+    let mut is_used = vec![false; old_count];
+    *is_used.last_mut().unwrap() = true;
+    for (i, instr) in instrs.iter().enumerate().rev() {
+        if is_used[i] {
+            instr.traverse_inputs(|x| is_used[x.0 as usize] = true);
+        }
     }
-    uses
+
+    let mut ids = Vec::with_capacity(old_count);
+
+    let mut retained = 0u32;
+    let instrs = instrs
+        .into_iter()
+        .zip(is_used)
+        .filter_map(|(mut instr, is_used)| {
+            ids.push(VarId(retained));
+            if !is_used {
+                return None;
+            }
+
+            match &mut instr {
+                Instr::Unary { operand, .. } => {
+                    *operand = ids[operand.0 as usize];
+                }
+                Instr::Binary { lhs, rhs, .. } => {
+                    *lhs = ids[lhs.0 as usize];
+                    *rhs = ids[rhs.0 as usize];
+                }
+                _ => (),
+            };
+            retained += 1;
+            Some(instr)
+        })
+        .collect::<Vec<_>>();
+
+    eprintln!("Removed {} unused variables", old_count as u32 - retained);
+    instrs
 }
 
 fn main() {
@@ -152,6 +348,22 @@ fn main() {
     eprintln!("Parsed code in: {:?}", timer.elapsed());
 
     let constants = parser.constants;
+    let instrs = {
+        let param_ranges = [
+            Range {
+                min: -1.0,
+                max: 1.0,
+            },
+            Range {
+                min: -1.0,
+                max: 1.0,
+            },
+        ];
+        let mut instrs = instrs.clone();
+        let replacements = range_optimization(param_ranges, &instrs, &constants);
+        apply_replacements(&mut instrs, &replacements);
+        cleanup_unused(instrs)
+    };
 
     let timer = Instant::now();
     let mut buf = CodeBuffer::default();
@@ -190,6 +402,7 @@ fn main() {
 
     let timer = Instant::now();
     let mut image = vec![0u8; image_size * image_size];
+    let mut temp = code.allocate_temp_buf();
     for y in 0..image_size {
         let row = &mut image[image_size * y..];
         for x in (0..image_size).step_by(8) {
@@ -200,7 +413,7 @@ fn main() {
                 let y = _mm256_set1_ps(y);
                 let x = _mm256_set1_ps(x);
                 let x = _mm256_add_ps(x, offsets);
-                let result = code.invoke(x, y, &constants);
+                let result = code.invoke(x, y, &mut temp, &constants);
                 chunk.copy_from_slice(&to_image_bytes(result));
             }
         }

@@ -1,4 +1,4 @@
-use crate::{Instr, OperandId};
+use crate::{BinaryOpcode, Instr, UnaryOpcode, VarId};
 use std::alloc::{self, Layout};
 use std::collections::BTreeSet;
 
@@ -131,56 +131,13 @@ impl CodeBuffer {
         self.operands(dest, val);
     }
 
-    const SCRATCH: Operand = Operand::Reg(15);
+    pub fn ret(&mut self) {
+        self.append(0xc3);
+    }
+
     const RAX: u8 = 0;
     const RCX: u8 = 1;
-
-    pub fn binary(&mut self, instr: &Instr, dest: u8, values: &[Operand]) {
-        let (x, y) = instr.as_binary().expect("Not a binary instruction");
-        let x = values[x.0 as usize];
-        let y = values[y.0 as usize];
-        let lhs = match x {
-            Operand::Reg(reg) => reg,
-            mem @ Operand::Memory { .. } => {
-                self.mov(Self::SCRATCH, mem);
-                Self::SCRATCH.register()
-            }
-        };
-        match instr {
-            Instr::Add(..) => self.add(dest, lhs, y),
-            Instr::Sub(..) => self.sub(dest, lhs, y),
-            Instr::Mul(..) => self.mul(dest, lhs, y),
-            Instr::Max(..) => self.max(dest, lhs, y),
-            Instr::Min(..) => self.min(dest, lhs, y),
-            x => unreachable!("Not a binary instruction: {:?}", x),
-        }
-    }
-
-    pub fn instruction(&mut self, instr: &Instr, dest: u8, values: &[Operand]) {
-        match instr {
-            Instr::Var(_) => (),
-            Instr::Const(disp) => {
-                self.broadcast(
-                    dest,
-                    Operand::Memory {
-                        base: Self::RAX,
-                        disp: *disp * std::mem::size_of::<f32>() as u32,
-                    },
-                );
-            }
-            Instr::Neg(x) => {
-                let x = values[x.0 as usize];
-                let scratch = Self::SCRATCH.register();
-                self.xor(scratch, scratch, Self::SCRATCH);
-                self.sub(dest, scratch, x);
-            }
-            Instr::Sqrt(x) => {
-                let x = values[x.0 as usize];
-                self.sqrt(dest, x);
-            }
-            _ => self.binary(instr, dest, values),
-        }
-    }
+    const SCRATCH: u8 = 15;
 
     const VALUE_SIZE: u32 = std::mem::size_of::<Ymm>() as u32;
 
@@ -191,9 +148,6 @@ impl CodeBuffer {
         let layout =
             Layout::from_size_align(page_size * num_pages, page_size).expect("invalid layout");
 
-        use std::arch::x86_64::_mm256_setzero_ps;
-        let default: Ymm = unsafe { _mm256_setzero_ps() };
-        let temp_buf = vec![default; self.stack_size as usize];
         unsafe {
             let ptr = alloc::alloc(layout);
             if ptr.is_null() {
@@ -213,7 +167,7 @@ impl CodeBuffer {
             InstalledCode {
                 buf: ptr,
                 layout,
-                temp_buf,
+                stack_size: self.stack_size as usize,
             }
         }
     }
@@ -222,9 +176,9 @@ impl CodeBuffer {
 #[derive(Default, Debug, Clone, Copy, PartialOrd, Ord, PartialEq, Eq)]
 struct LiveInterval {
     // exclusive
-    end: OperandId,
+    end: VarId,
     // inclusive
-    start: OperandId,
+    start: VarId,
 }
 
 struct RegisterAllocator {
@@ -236,6 +190,20 @@ struct RegisterAllocator {
     active_mem: BTreeSet<LiveInterval>,
     available_mem: Vec<u32>,
     stack_size: u32,
+}
+
+impl std::ops::Index<VarId> for RegisterAllocator {
+    type Output = Operand;
+
+    fn index(&self, index: VarId) -> &Self::Output {
+        &self.assigned[index.0 as usize]
+    }
+}
+
+impl std::ops::IndexMut<VarId> for RegisterAllocator {
+    fn index_mut(&mut self, index: VarId) -> &mut Self::Output {
+        &mut self.assigned[index.0 as usize]
+    }
 }
 
 impl RegisterAllocator {
@@ -252,14 +220,14 @@ impl RegisterAllocator {
         }
     }
 
-    fn free_dead_values(&mut self, cur: OperandId) {
+    fn free_dead_values(&mut self, cur: VarId) {
         // Make unused registers available
         while let Some(i) = self.active_regs.first().copied() {
             if i.end > cur {
                 break;
             }
             self.active_regs.pop_first();
-            match self.assigned[i.start.0 as usize] {
+            match self[i.start] {
                 Operand::Reg(reg) => self.available_regs.push(reg),
                 _ => unreachable!(),
             }
@@ -270,7 +238,7 @@ impl RegisterAllocator {
                 break;
             }
             self.active_mem.pop_first();
-            match self.assigned[i.start.0 as usize] {
+            match self[i.start] {
                 Operand::Memory { disp, .. } => self.available_mem.push(disp),
                 _ => unreachable!(),
             }
@@ -300,15 +268,62 @@ impl RegisterAllocator {
     }
 
     fn spill(&mut self, val: LiveInterval) -> (u8, Operand) {
-        let i = val.start.0 as usize;
-        let Operand::Reg(reg) = self.assigned[i] else {
-            panic!("Cannot spill a memory location: {:?}", self.assigned[i]);
+        let Operand::Reg(reg) = self[val.start] else {
+            panic!("Cannot spill a memory location: {:?}", self[val.start]);
         };
 
         let new_loc = self.pop_stack_slot();
-        self.assigned[i] = new_loc;
+        self[val.start] = new_loc;
         self.active_mem.insert(val);
         (reg, new_loc)
+    }
+
+    fn binary(&mut self, buf: &mut CodeBuffer, instr: &Instr, dest: u8) {
+        let Instr::Binary { op, lhs, rhs } = instr else {
+            unreachable!("Not a binary instruction");
+        };
+        let (x, y) = (self[*lhs], self[*rhs]);
+        let lhs = match x {
+            Operand::Reg(reg) => reg,
+            mem @ Operand::Memory { .. } => {
+                buf.mov(Operand::Reg(CodeBuffer::SCRATCH), mem);
+                CodeBuffer::SCRATCH
+            }
+        };
+        match op {
+            BinaryOpcode::Add => buf.add(dest, lhs, y),
+            BinaryOpcode::Sub => buf.sub(dest, lhs, y),
+            BinaryOpcode::Mul => buf.mul(dest, lhs, y),
+            BinaryOpcode::Max => buf.max(dest, lhs, y),
+            BinaryOpcode::Min => buf.min(dest, lhs, y),
+        }
+    }
+
+    fn instruction(&mut self, buf: &mut CodeBuffer, instr: &Instr, dest: u8) {
+        match instr {
+            Instr::Var(_) => (),
+            Instr::Const(disp) => {
+                buf.broadcast(
+                    dest,
+                    Operand::Memory {
+                        base: CodeBuffer::RAX,
+                        disp: *disp * std::mem::size_of::<f32>() as u32,
+                    },
+                );
+            }
+            Instr::Unary { op, operand } => {
+                let x = self[*operand];
+                match op {
+                    UnaryOpcode::Neg => {
+                        let scratch = CodeBuffer::SCRATCH;
+                        buf.xor(scratch, scratch, Operand::Reg(scratch));
+                        buf.sub(dest, scratch, x);
+                    }
+                    UnaryOpcode::Sqrt => buf.sqrt(dest, x),
+                }
+            }
+            _ => self.binary(buf, instr, dest),
+        }
     }
 
     fn generate_code(&mut self, buf: &mut CodeBuffer, instrs: &[Instr]) {
@@ -324,7 +339,7 @@ impl RegisterAllocator {
         for (i, instr) in instrs.iter().enumerate() {
             let interval = LiveInterval {
                 end: ends[i],
-                start: OperandId(i as u32),
+                start: VarId(i as u32),
             };
 
             self.free_dead_values(interval.start);
@@ -334,7 +349,7 @@ impl RegisterAllocator {
                 // at the beginning of the function
                 self.assign_register(*reg as u8, interval);
             } else if let Some(reg) = self.available_regs.pop() {
-                buf.instruction(instr, reg, &self.assigned);
+                self.instruction(buf, instr, reg);
                 self.assign_register(reg, interval);
             } else {
                 // Need to spill something
@@ -351,19 +366,20 @@ impl RegisterAllocator {
 
                     let (reg, mem) = self.spill(candidate);
                     buf.mov(mem, Operand::Reg(reg));
-                    buf.instruction(instr, reg, &self.assigned);
+                    self.instruction(buf, instr, reg);
                     self.assign_register(reg, interval);
                 } else {
                     let scratch = CodeBuffer::SCRATCH;
-                    buf.instruction(instr, scratch.register(), &self.assigned);
+                    self.instruction(buf, instr, scratch);
                     let mem = self.pop_stack_slot();
-                    buf.mov(mem, scratch);
+                    buf.mov(mem, Operand::Reg(scratch));
                     self.assign_memory(mem, interval);
                 }
             }
         }
         // Last element is the returned value, so it must go in ymm0
-        buf.instruction(last, 0, &self.assigned);
+        self.instruction(buf, last, 0);
+        buf.ret();
 
         buf.stack_size = self.stack_size;
         eprintln!(
@@ -380,7 +396,7 @@ pub fn generate_code(buf: &mut CodeBuffer, instrs: &[Instr]) {
 pub struct InstalledCode {
     buf: *mut u8,
     layout: Layout,
-    temp_buf: Vec<Ymm>,
+    stack_size: usize,
 }
 
 impl Drop for InstalledCode {
@@ -392,10 +408,17 @@ impl Drop for InstalledCode {
     }
 }
 
+impl InstalledCode {
+    pub fn allocate_temp_buf(&self) -> Vec<Ymm> {
+        let empty = unsafe { std::arch::x86_64::_mm256_setzero_ps() };
+        vec![empty; self.stack_size]
+    }
+}
+
 pub type Ymm = std::arch::x86_64::__m256;
 
 impl InstalledCode {
-    pub fn invoke(&self, x: Ymm, y: Ymm, constants: &[f32]) -> Ymm {
+    pub fn invoke(&self, x: Ymm, y: Ymm, temp: &mut [Ymm], constants: &[f32]) -> Ymm {
         unsafe {
             let fn_ptr = self.buf;
             let result: Ymm;
@@ -403,10 +426,23 @@ impl InstalledCode {
                 "call {}",
                 in(reg) fn_ptr,
                 in("rax") constants.as_ptr(),
-                in("rcx") self.temp_buf.as_ptr(),
+                in("rcx") temp.as_mut_ptr(),
                 inout("ymm0") x => result,
-                in("ymm1") y,
-                clobber_abi("C"),
+                inout("ymm1") y => _,
+                out("ymm2") _,
+                out("ymm3") _,
+                out("ymm4") _,
+                out("ymm5") _,
+                out("ymm6")  _,
+                out("ymm7")  _,
+                out("ymm8")  _,
+                out("ymm9")  _,
+                out("ymm10") _,
+                out("ymm11") _,
+                out("ymm12") _,
+                out("ymm13") _,
+                out("ymm14") _,
+                out("ymm15") _,
                 options(nostack),
             );
             result

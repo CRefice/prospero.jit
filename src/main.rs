@@ -342,18 +342,17 @@ fn specialize(mut instrs: Vec<Instr>, constants: &[f32], param_ranges: [Range; 2
 }
 
 fn main() {
-    let path = std::env::args().nth(1).expect("No argument provided");
-    let image_size = std::env::args()
-        .nth(2)
-        .expect("Image size required")
-        .parse()
-        .expect("Could not parse image size");
+    let mut args = std::env::args().skip(1);
+    let path = args.next().expect("No argument provided");
+    let image_size: usize = args
+        .next()
+        .map(|x| x.parse().expect("Could not parse image size"))
+        .unwrap_or(2048);
 
-    let num_splits: usize = std::env::args()
-        .nth(3)
-        .expect("Image size required")
-        .parse()
-        .expect("Could not parse image size");
+    let num_splits: usize = args
+        .next()
+        .map(|x| x.parse().expect("Could not parse number of chunks"))
+        .unwrap_or(16);
 
     let file = File::open(path).expect("Could not open input file");
     let file = BufReader::new(file);
@@ -417,7 +416,7 @@ fn main() {
 
     fn to_image_bytes(x: Ymm) -> [u8; 8] {
         unsafe {
-            let mask = _mm256_cmp_ps::<_CMP_GT_OQ>(x, _mm256_setzero_ps());
+            let mask = _mm256_cmp_ps::<_CMP_LT_OQ>(x, _mm256_setzero_ps());
             let ones = _mm256_set1_ps(255.0);
             let result = _mm256_and_ps(mask, ones);
             let result = _mm256_cvtps_epi32(result);

@@ -168,6 +168,7 @@ impl CodeBuffer {
                 buf: ptr,
                 layout,
                 stack_size: self.stack_size as usize,
+                _code_size: self.buf.len(),
             }
         }
     }
@@ -183,12 +184,8 @@ struct LiveInterval {
 
 struct RegisterAllocator {
     assigned: Vec<Operand>,
-
-    active_regs: BTreeSet<LiveInterval>,
+    active: BTreeSet<LiveInterval>,
     available_regs: Vec<u8>,
-
-    active_mem: BTreeSet<LiveInterval>,
-    available_mem: Vec<u32>,
     stack_size: u32,
 }
 
@@ -210,36 +207,23 @@ impl RegisterAllocator {
     fn new(instrs: &[Instr]) -> Self {
         Self {
             assigned: Vec::with_capacity(instrs.len()),
-            active_regs: BTreeSet::new(),
+            active: BTreeSet::new(),
             // ymm0 and ymm1 are occupied by params
             // keep ymm15 as scratch register for spilled values
             available_regs: (2..15).rev().collect(),
-            active_mem: BTreeSet::new(),
-            available_mem: Vec::new(),
             stack_size: 0,
         }
     }
 
     fn free_dead_values(&mut self, cur: VarId) {
         // Make unused registers available
-        while let Some(i) = self.active_regs.first().copied() {
+        while let Some(i) = self.active.first().copied() {
             if i.end > cur {
                 break;
             }
-            self.active_regs.pop_first();
+            self.active.pop_first();
             match self[i.start] {
                 Operand::Reg(reg) => self.available_regs.push(reg),
-                _ => unreachable!(),
-            }
-        }
-
-        while let Some(i) = self.active_mem.first().copied() {
-            if i.end > cur {
-                break;
-            }
-            self.active_mem.pop_first();
-            match self[i.start] {
-                Operand::Memory { disp, .. } => self.available_mem.push(disp),
                 _ => unreachable!(),
             }
         }
@@ -247,20 +231,15 @@ impl RegisterAllocator {
 
     fn assign_register(&mut self, reg: u8, interval: LiveInterval) {
         self.assigned.push(Operand::Reg(reg));
-        self.active_regs.insert(interval);
+        self.active.insert(interval);
     }
 
-    fn assign_memory(&mut self, operand: Operand, interval: LiveInterval) {
-        self.assigned.push(operand);
-        self.active_mem.insert(interval);
-    }
-
-    fn pop_stack_slot(&mut self) -> Operand {
-        let disp = self.available_mem.pop().unwrap_or_else(|| {
+    fn new_stack_slot(&mut self) -> Operand {
+        let disp = {
             let slot = self.stack_size;
             self.stack_size += 1;
             slot * CodeBuffer::VALUE_SIZE
-        });
+        };
         Operand::Memory {
             base: CodeBuffer::RCX,
             disp,
@@ -272,9 +251,8 @@ impl RegisterAllocator {
             panic!("Cannot spill a memory location: {:?}", self[val.start]);
         };
 
-        let new_loc = self.pop_stack_slot();
+        let new_loc = self.new_stack_slot();
         self[val.start] = new_loc;
-        self.active_mem.insert(val);
         (reg, new_loc)
     }
 
@@ -334,8 +312,6 @@ impl RegisterAllocator {
             return;
         };
 
-        let mut num_spills = 0;
-
         for (i, instr) in instrs.iter().enumerate() {
             let interval = LiveInterval {
                 end: ends[i],
@@ -353,16 +329,15 @@ impl RegisterAllocator {
                 self.assign_register(reg, interval);
             } else {
                 // Need to spill something
-                num_spills += 1;
 
                 let candidate = self
-                    .active_regs
+                    .active
                     .last()
                     .copied()
                     .expect("There's no live value to spill");
 
                 if candidate.end > interval.end {
-                    self.active_regs.pop_last();
+                    self.active.pop_last();
 
                     let (reg, mem) = self.spill(candidate);
                     buf.mov(mem, Operand::Reg(reg));
@@ -371,9 +346,9 @@ impl RegisterAllocator {
                 } else {
                     let scratch = CodeBuffer::SCRATCH;
                     self.instruction(buf, instr, scratch);
-                    let mem = self.pop_stack_slot();
+                    let mem = self.new_stack_slot();
                     buf.mov(mem, Operand::Reg(scratch));
-                    self.assign_memory(mem, interval);
+                    self.assigned.push(mem);
                 }
             }
         }
@@ -382,10 +357,6 @@ impl RegisterAllocator {
         buf.ret();
 
         buf.stack_size = self.stack_size;
-        eprintln!(
-            "Spilled {} variables in {} slots of memory",
-            num_spills, self.stack_size
-        );
     }
 }
 
@@ -397,18 +368,28 @@ pub struct InstalledCode {
     buf: *mut u8,
     layout: Layout,
     stack_size: usize,
+    _code_size: usize,
 }
 
 impl Drop for InstalledCode {
     fn drop(&mut self) {
         use std::alloc;
         unsafe {
+            libc::mprotect(
+                self.buf as *mut libc::c_void,
+                self.layout.size(),
+                libc::PROT_READ | libc::PROT_WRITE,
+            );
             alloc::dealloc(self.buf, self.layout);
         }
     }
 }
 
 impl InstalledCode {
+    pub fn _code(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.buf, self._code_size) }
+    }
+
     pub fn allocate_temp_buf(&self) -> Vec<Ymm> {
         let empty = unsafe { std::arch::x86_64::_mm256_setzero_ps() };
         vec![empty; self.stack_size]

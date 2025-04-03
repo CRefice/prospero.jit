@@ -193,10 +193,10 @@ fn range_optimization(
         let id = VarId(i as u32);
         let range = match instr {
             Instr::Var(x) => param_ranges[*x as usize],
-            Instr::Const(x) => Range {
-                min: constants[*x as usize],
-                max: constants[*x as usize],
-            },
+            Instr::Const(x) => {
+                let c = constants[*x as usize];
+                Range { min: c, max: c }
+            }
             Instr::Unary { op, operand } => {
                 let range = &ranges[operand.0 as usize];
                 match op {
@@ -223,6 +223,15 @@ fn range_optimization(
                         min: xr.min - yr.max,
                         max: xr.max - yr.min,
                     },
+                    Mul if lhs == rhs => {
+                        let min = if xr.min <= 0.0 && xr.max >= 0.0 {
+                            0.0
+                        } else {
+                            f32::min(xr.min * xr.min, xr.max * xr.max)
+                        };
+                        let max = f32::max(xr.min * xr.min, xr.max * xr.max);
+                        Range { min, max }
+                    }
                     Mul => range_for(&[
                         xr.min * yr.min,
                         xr.min * yr.max,
@@ -231,10 +240,12 @@ fn range_optimization(
                     ]),
                     Max => {
                         if xr.min > yr.max {
-                            replacements.insert(id, *lhs);
+                            let lhs = replacements.get(lhs).copied().unwrap_or(*lhs);
+                            replacements.insert(id, lhs);
                             *xr
                         } else if xr.max < yr.min {
-                            replacements.insert(id, *rhs);
+                            let rhs = replacements.get(rhs).copied().unwrap_or(*rhs);
+                            replacements.insert(id, rhs);
                             *yr
                         } else {
                             Range {
@@ -245,10 +256,12 @@ fn range_optimization(
                     }
                     Min => {
                         if xr.min > yr.max {
-                            replacements.insert(id, *rhs);
+                            let rhs = replacements.get(rhs).copied().unwrap_or(*rhs);
+                            replacements.insert(id, rhs);
                             *yr
                         } else if xr.max < yr.min {
-                            replacements.insert(id, *lhs);
+                            let lhs = replacements.get(lhs).copied().unwrap_or(*lhs);
+                            replacements.insert(id, lhs);
                             *xr
                         } else {
                             Range {
@@ -270,7 +283,7 @@ fn apply_replacements(instrs: &mut [Instr], replacements: &HashMap<VarId, VarId>
     for instr in instrs.iter_mut() {
         match instr {
             Instr::Unary { operand, .. } => {
-                *operand = replacements.get(operand).copied().unwrap_or(*operand)
+                *operand = replacements.get(operand).copied().unwrap_or(*operand);
             }
             Instr::Binary { lhs, rhs, .. } => {
                 *lhs = replacements.get(lhs).copied().unwrap_or(*lhs);
@@ -282,8 +295,7 @@ fn apply_replacements(instrs: &mut [Instr], replacements: &HashMap<VarId, VarId>
 }
 
 fn cleanup_unused(instrs: Vec<Instr>) -> Vec<Instr> {
-    let old_count = instrs.len();
-    let mut is_used = vec![false; old_count];
+    let mut is_used = vec![false; instrs.len()];
     *is_used.last_mut().unwrap() = true;
     for (i, instr) in instrs.iter().enumerate().rev() {
         if is_used[i] {
@@ -291,10 +303,10 @@ fn cleanup_unused(instrs: Vec<Instr>) -> Vec<Instr> {
         }
     }
 
-    let mut ids = Vec::with_capacity(old_count);
+    let mut ids = Vec::with_capacity(instrs.len());
 
     let mut retained = 0u32;
-    let instrs = instrs
+    instrs
         .into_iter()
         .zip(is_used)
         .filter_map(|(mut instr, is_used)| {
@@ -316,16 +328,29 @@ fn cleanup_unused(instrs: Vec<Instr>) -> Vec<Instr> {
             retained += 1;
             Some(instr)
         })
-        .collect::<Vec<_>>();
+        .collect()
+}
 
-    eprintln!("Removed {} unused variables", old_count as u32 - retained);
-    instrs
+fn specialize(mut instrs: Vec<Instr>, constants: &[f32], param_ranges: [Range; 2]) -> Vec<Instr> {
+    let replacements = range_optimization(param_ranges, &instrs, constants);
+    let old_last = VarId(instrs.len() as u32 - 1);
+    if let Some(last) = replacements.get(&old_last) {
+        instrs.truncate(last.0 as usize + 1)
+    }
+    apply_replacements(&mut instrs, &replacements);
+    cleanup_unused(instrs)
 }
 
 fn main() {
     let path = std::env::args().nth(1).expect("No argument provided");
     let image_size = std::env::args()
         .nth(2)
+        .expect("Image size required")
+        .parse()
+        .expect("Could not parse image size");
+
+    let num_splits: usize = std::env::args()
+        .nth(3)
         .expect("Image size required")
         .parse()
         .expect("Could not parse image size");
@@ -348,29 +373,33 @@ fn main() {
     eprintln!("Parsed code in: {:?}", timer.elapsed());
 
     let constants = parser.constants;
-    let instrs = {
-        let param_ranges = [
-            Range {
-                min: -1.0,
-                max: 1.0,
-            },
-            Range {
-                min: -1.0,
-                max: 1.0,
-            },
-        ];
-        let mut instrs = instrs.clone();
-        let replacements = range_optimization(param_ranges, &instrs, &constants);
-        apply_replacements(&mut instrs, &replacements);
-        cleanup_unused(instrs)
-    };
+
+    let ranges = (0..num_splits)
+        .map(|i| {
+            let size = 2.0 / num_splits as f32;
+            let min = i as f32 * size - 1.0;
+            let max = min + size;
+            Range { min, max }
+        })
+        .collect::<Vec<_>>();
 
     let timer = Instant::now();
-    let mut buf = CodeBuffer::default();
-    codegen::generate_code(&mut buf, &instrs);
+    let specialized: Vec<Vec<codegen::InstalledCode>> = ranges
+        .iter()
+        .rev()
+        .map(|y| {
+            ranges
+                .iter()
+                .map(|x| {
+                    let instrs = specialize(instrs.clone(), &constants, [*x, *y]);
+                    let mut buf = CodeBuffer::default();
+                    codegen::generate_code(&mut buf, &instrs);
+                    buf.install()
+                })
+                .collect()
+        })
+        .collect();
     eprintln!("Compiled code in: {:?}", timer.elapsed());
-
-    let code = buf.install();
 
     fn to_unit_rect(i: usize, image_size: usize) -> f32 {
         let i = i as isize;
@@ -402,19 +431,29 @@ fn main() {
 
     let timer = Instant::now();
     let mut image = vec![0u8; image_size * image_size];
-    let mut temp = code.allocate_temp_buf();
-    for y in 0..image_size {
-        let row = &mut image[image_size * y..];
-        for x in (0..image_size).step_by(8) {
-            let chunk = &mut row[x..(x + 8)];
-            let y = to_unit_rect(image_size - y, image_size);
-            let x = to_unit_rect(x, image_size);
-            unsafe {
-                let y = _mm256_set1_ps(y);
-                let x = _mm256_set1_ps(x);
-                let x = _mm256_add_ps(x, offsets);
-                let result = code.invoke(x, y, &mut temp, &constants);
-                chunk.copy_from_slice(&to_image_bytes(result));
+
+    let block_size = image_size / num_splits;
+    for (y, row) in specialized.into_iter().enumerate() {
+        for (x, code) in row.into_iter().enumerate() {
+            let start_y = y * block_size;
+            let end_y = start_y + block_size;
+            let start_x = x * block_size;
+            let end_x = start_x + block_size;
+            let mut temp = code.allocate_temp_buf();
+            for y in start_y..end_y {
+                let row = &mut image[image_size * y..];
+                for x in (start_x..end_x).step_by(8) {
+                    let chunk = &mut row[x..(x + 8)];
+                    let y = to_unit_rect(image_size - y, image_size);
+                    let x = to_unit_rect(x, image_size);
+                    unsafe {
+                        let y = _mm256_set1_ps(y);
+                        let x = _mm256_set1_ps(x);
+                        let x = _mm256_add_ps(x, offsets);
+                        let result = code.invoke(x, y, &mut temp, &constants);
+                        chunk.copy_from_slice(&to_image_bytes(result));
+                    }
+                }
             }
         }
     }

@@ -19,13 +19,14 @@ impl Operand {
 
 #[derive(Default)]
 pub struct CodeBuffer {
-    buf: Vec<u8>,
+    code: Vec<u8>,
+    constants: Vec<f32>,
     stack_size: u32,
 }
 
 impl CodeBuffer {
     fn append(&mut self, byte: u8) {
-        self.buf.push(byte);
+        self.code.push(byte);
     }
 
     fn vex_full(&mut self, reg: u8, vvvv: u8, r_m: u8, pp: u8, map: u8) {
@@ -63,12 +64,12 @@ impl CodeBuffer {
             Operand::Reg(r_m) => self.mod_r_m(0b11, reg, r_m),
             Operand::Memory { base, disp } => {
                 self.mod_r_m(0b10, reg, base);
-                self.buf.extend_from_slice(&disp.to_le_bytes());
+                self.code.extend_from_slice(&disp.to_le_bytes());
             }
         }
     }
 
-    pub fn mov(&mut self, dest: Operand, source: Operand) {
+    fn mov(&mut self, dest: Operand, source: Operand) {
         let (reg, r_m, opcode) = match (dest, source) {
             (Operand::Reg(reg), source) => (reg, source, 0x10),
             (Operand::Memory { .. }, Operand::Reg(reg)) => (reg, dest, 0x11),
@@ -79,7 +80,7 @@ impl CodeBuffer {
         self.operands(reg, r_m);
     }
 
-    pub fn broadcast(&mut self, dest: u8, source: Operand) {
+    fn broadcast(&mut self, dest: u8, source: Operand) {
         let Operand::Memory { base, disp } = source else {
             unreachable!("Cannot broadcast register value: {:?}", source)
         };
@@ -89,50 +90,59 @@ impl CodeBuffer {
         self.operands(dest, Operand::Memory { base, disp });
     }
 
-    pub fn add(&mut self, dest: u8, x: u8, y: Operand) {
+    fn add(&mut self, dest: u8, x: u8, y: Operand) {
         self.vex(dest, x, y.register());
         self.append(0x58);
         self.operands(dest, y);
     }
 
-    pub fn sub(&mut self, dest: u8, x: u8, y: Operand) {
+    fn sub(&mut self, dest: u8, x: u8, y: Operand) {
         self.vex(dest, x, y.register());
         self.append(0x5c);
         self.operands(dest, y);
     }
 
-    pub fn mul(&mut self, dest: u8, x: u8, y: Operand) {
+    fn mul(&mut self, dest: u8, x: u8, y: Operand) {
         self.vex(dest, x, y.register());
         self.append(0x59);
         self.operands(dest, y);
     }
 
-    pub fn max(&mut self, dest: u8, x: u8, y: Operand) {
+    fn max(&mut self, dest: u8, x: u8, y: Operand) {
         self.vex(dest, x, y.register());
         self.append(0x5f);
         self.operands(dest, y);
     }
 
-    pub fn min(&mut self, dest: u8, x: u8, y: Operand) {
+    fn min(&mut self, dest: u8, x: u8, y: Operand) {
         self.vex(dest, x, y.register());
         self.append(0x5d);
         self.operands(dest, y);
     }
 
-    pub fn xor(&mut self, dest: u8, x: u8, y: Operand) {
+    fn xor(&mut self, dest: u8, x: u8, y: Operand) {
         self.vex(dest, x, y.register());
         self.append(0x57);
         self.operands(dest, y);
     }
 
-    pub fn sqrt(&mut self, dest: u8, val: Operand) {
+    fn sqrt(&mut self, dest: u8, val: Operand) {
         self.vex(dest, 0, val.register());
         self.append(0x51);
         self.operands(dest, val);
     }
 
-    pub fn ret(&mut self) {
+    fn ret(&mut self) {
         self.append(0xc3);
+    }
+
+    fn constant(&mut self, cnst: f32) -> Operand {
+        let slot = self.constants.len() as u32;
+        self.constants.push(cnst);
+        Operand::Memory {
+            base: Self::RAX,
+            disp: slot * std::mem::size_of::<f32>() as u32,
+        }
     }
 
     const RAX: u8 = 0;
@@ -144,7 +154,7 @@ impl CodeBuffer {
     pub fn install(self) -> InstalledCode {
         use libc::{_SC_PAGESIZE, sysconf};
         let page_size = unsafe { sysconf(_SC_PAGESIZE) } as usize;
-        let num_pages = usize::max(1, self.buf.len().div_ceil(page_size));
+        let num_pages = usize::max(1, self.code.len().div_ceil(page_size));
         let layout =
             Layout::from_size_align(page_size * num_pages, page_size).expect("invalid layout");
 
@@ -155,7 +165,7 @@ impl CodeBuffer {
             }
             // Fill with RET instructions
             ptr.write_bytes(0xc3, layout.size());
-            ptr.copy_from_nonoverlapping(self.buf.as_ptr(), self.buf.len());
+            ptr.copy_from_nonoverlapping(self.code.as_ptr(), self.code.len());
 
             // Make memory executable and not writable
             libc::mprotect(
@@ -165,10 +175,11 @@ impl CodeBuffer {
             );
 
             InstalledCode {
-                buf: ptr,
-                layout,
+                code_buf: ptr,
+                _code_size: self.code.len(),
                 stack_size: self.stack_size as usize,
-                _code_size: self.buf.len(),
+                constants: self.constants,
+                layout,
             }
         }
     }
@@ -280,14 +291,9 @@ impl RegisterAllocator {
     fn instruction(&mut self, buf: &mut CodeBuffer, instr: &Instr, dest: u8) {
         match instr {
             Instr::Var(_) => (),
-            Instr::Const(disp) => {
-                buf.broadcast(
-                    dest,
-                    Operand::Memory {
-                        base: CodeBuffer::RAX,
-                        disp: *disp * std::mem::size_of::<f32>() as u32,
-                    },
-                );
+            Instr::Const(cnst) => {
+                let cnst = buf.constant(*cnst);
+                buf.broadcast(dest, cnst);
             }
             Instr::Unary { op, operand } => {
                 let x = self[*operand];
@@ -304,8 +310,18 @@ impl RegisterAllocator {
         }
     }
 
+    fn compute_last_usage(instrs: &[Instr]) -> Vec<VarId> {
+        let mut uses: Vec<VarId> = Vec::new();
+        uses.resize_with(instrs.len(), Default::default);
+        for (id, i) in instrs.iter().enumerate() {
+            let id = VarId(id as u32);
+            i.traverse_inputs(|input| uses[input.0 as usize] = id);
+        }
+        uses
+    }
+
     fn generate_code(&mut self, buf: &mut CodeBuffer, instrs: &[Instr]) {
-        let ends = crate::compute_last_usage(instrs);
+        let ends = Self::compute_last_usage(instrs);
 
         let Some((last, instrs)) = instrs.split_last() else {
             // No need to do anything if there are no instructions
@@ -365,10 +381,11 @@ pub fn generate_code(buf: &mut CodeBuffer, instrs: &[Instr]) {
 }
 
 pub struct InstalledCode {
-    buf: *mut u8,
-    layout: Layout,
-    stack_size: usize,
+    code_buf: *mut u8,
     _code_size: usize,
+    constants: Vec<f32>,
+    stack_size: usize,
+    layout: Layout,
 }
 
 impl Drop for InstalledCode {
@@ -376,18 +393,18 @@ impl Drop for InstalledCode {
         use std::alloc;
         unsafe {
             libc::mprotect(
-                self.buf as *mut libc::c_void,
+                self.code_buf as *mut libc::c_void,
                 self.layout.size(),
                 libc::PROT_READ | libc::PROT_WRITE,
             );
-            alloc::dealloc(self.buf, self.layout);
+            alloc::dealloc(self.code_buf, self.layout);
         }
     }
 }
 
 impl InstalledCode {
     pub fn _code(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.buf, self._code_size) }
+        unsafe { std::slice::from_raw_parts(self.code_buf, self._code_size) }
     }
 
     pub fn allocate_temp_buf(&self) -> Vec<Ymm> {
@@ -399,14 +416,14 @@ impl InstalledCode {
 pub type Ymm = std::arch::x86_64::__m256;
 
 impl InstalledCode {
-    pub fn invoke(&self, x: Ymm, y: Ymm, temp: &mut [Ymm], constants: &[f32]) -> Ymm {
+    pub fn invoke(&self, x: Ymm, y: Ymm, temp: &mut [Ymm]) -> Ymm {
         unsafe {
-            let fn_ptr = self.buf;
+            let fn_ptr = self.code_buf;
             let result: Ymm;
             std::arch::asm!(
                 "call {}",
                 in(reg) fn_ptr,
-                in("rax") constants.as_ptr(),
+                in("rax") self.constants.as_ptr(),
                 in("rcx") temp.as_mut_ptr(),
                 inout("ymm0") x => result,
                 inout("ymm1") y => _,

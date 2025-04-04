@@ -381,7 +381,7 @@ pub fn generate_code(buf: &mut CodeBuffer, instrs: &[Instr]) {
 }
 
 pub struct InstalledCode {
-    code_buf: *mut u8,
+    code_buf: *const u8,
     _code_size: usize,
     constants: Vec<f32>,
     stack_size: usize,
@@ -397,10 +397,12 @@ impl Drop for InstalledCode {
                 self.layout.size(),
                 libc::PROT_READ | libc::PROT_WRITE,
             );
-            alloc::dealloc(self.code_buf, self.layout);
+            alloc::dealloc(self.code_buf as *mut u8, self.layout);
         }
     }
 }
+
+unsafe impl Send for InstalledCode {}
 
 impl InstalledCode {
     pub fn _code(&self) -> &[u8] {

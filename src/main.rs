@@ -236,31 +236,45 @@ fn main() {
     let timer = Instant::now();
     let mut image = vec![0u8; image_size * image_size];
 
-    let block_size = image_size / num_splits;
-    for (y, row) in specialized.into_iter().enumerate() {
-        for (x, code) in row.into_iter().enumerate() {
-            let start_y = y * block_size;
-            let end_y = start_y + block_size;
-            let start_x = x * block_size;
-            let end_x = start_x + block_size;
-            let mut temp = code.allocate_temp_buf();
-            for y in start_y..end_y {
-                let row = &mut image[image_size * y..];
-                for x in (start_x..end_x).step_by(8) {
-                    let chunk = &mut row[x..(x + 8)];
-                    let y = to_unit_rect(image_size - y, image_size);
-                    let x = to_unit_rect(x, image_size);
-                    unsafe {
-                        let y = _mm256_set1_ps(y);
-                        let x = _mm256_set1_ps(x);
-                        let x = _mm256_add_ps(x, offsets);
-                        let result = code.invoke(x, y, &mut temp);
-                        chunk.copy_from_slice(&to_image_bytes(result));
-                    }
-                }
-            }
+    struct Smuggle(*mut u8);
+    unsafe impl Send for Smuggle {}
+    impl Smuggle {
+        fn as_slice(&mut self, len: usize) -> &mut [u8] {
+            unsafe { std::slice::from_raw_parts_mut(self.0, len) }
         }
     }
+
+    let block_size = image_size / num_splits;
+    std::thread::scope(|s| {
+        for (y, row) in specialized.into_iter().enumerate() {
+            for (x, code) in row.into_iter().enumerate() {
+                let mut image = Smuggle(image.as_mut_ptr());
+                s.spawn(move || {
+                    let start_y = y * block_size;
+                    let end_y = start_y + block_size;
+                    let start_x = x * block_size;
+                    let end_x = start_x + block_size;
+                    let mut temp = code.allocate_temp_buf();
+                    let image = image.as_slice(image_size * image_size);
+                    for y in start_y..end_y {
+                        let row = &mut image[image_size * y..];
+                        for x in (start_x..end_x).step_by(8) {
+                            let chunk = &mut row[x..(x + 8)];
+                            let y = to_unit_rect(image_size - y, image_size);
+                            let x = to_unit_rect(x, image_size);
+                            unsafe {
+                                let y = _mm256_set1_ps(y);
+                                let x = _mm256_set1_ps(x);
+                                let x = _mm256_add_ps(x, offsets);
+                                let result = code.invoke(x, y, &mut temp);
+                                chunk.copy_from_slice(&to_image_bytes(result));
+                            }
+                        }
+                    }
+                });
+            }
+        }
+    });
     eprintln!("Executed kernel in: {:?}", timer.elapsed());
 
     image::save_buffer(

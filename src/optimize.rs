@@ -1,8 +1,6 @@
 use crate::{BinaryOpcode, Instr, UnaryOpcode, VarId};
 
-use std::collections::HashMap;
-
-#[derive(Debug, Clone, Copy)]
+#[derive(Default, Debug, Clone, Copy)]
 pub struct Range {
     pub min: f32,
     pub max: f32,
@@ -14,11 +12,10 @@ fn range_for(elems: &[f32]) -> Range {
     Range { min, max }
 }
 
-fn range_optimization(param_ranges: &[Range], instrs: &[Instr]) -> HashMap<VarId, VarId> {
-    let mut ranges: Vec<Range> = Vec::new();
-    let mut replacements: HashMap<VarId, VarId> = HashMap::new();
+fn range_optimization(param_ranges: &[Range], instrs: &[Instr]) -> Vec<VarId> {
+    let mut ranges: Vec<Range> = vec![Default::default(); instrs.len()];
+    let mut replacements: Vec<VarId> = (0..(instrs.len() as u32)).map(VarId).collect();
     for (i, instr) in instrs.iter().enumerate() {
-        let id = VarId(i as u32);
         let range = match instr {
             Instr::Var(x) => param_ranges[*x as usize],
             Instr::Const(c) => Range { min: *c, max: *c },
@@ -66,12 +63,12 @@ fn range_optimization(param_ranges: &[Range], instrs: &[Instr]) -> HashMap<VarId
                     ]),
                     Max => {
                         if xr.min > yr.max {
-                            let lhs = replacements.get(lhs).copied().unwrap_or(*lhs);
-                            replacements.insert(id, lhs);
+                            let lhs = replacements[lhs.0 as usize];
+                            replacements[i] = lhs;
                             *xr
                         } else if xr.max < yr.min {
-                            let rhs = replacements.get(rhs).copied().unwrap_or(*rhs);
-                            replacements.insert(id, rhs);
+                            let rhs = replacements[rhs.0 as usize];
+                            replacements[i] = rhs;
                             *yr
                         } else {
                             Range {
@@ -82,12 +79,12 @@ fn range_optimization(param_ranges: &[Range], instrs: &[Instr]) -> HashMap<VarId
                     }
                     Min => {
                         if xr.min > yr.max {
-                            let rhs = replacements.get(rhs).copied().unwrap_or(*rhs);
-                            replacements.insert(id, rhs);
+                            let rhs = replacements[rhs.0 as usize];
+                            replacements[i] = rhs;
                             *yr
                         } else if xr.max < yr.min {
-                            let lhs = replacements.get(lhs).copied().unwrap_or(*lhs);
-                            replacements.insert(id, lhs);
+                            let lhs = replacements[lhs.0 as usize];
+                            replacements[i] = lhs;
                             *xr
                         } else {
                             Range {
@@ -100,27 +97,27 @@ fn range_optimization(param_ranges: &[Range], instrs: &[Instr]) -> HashMap<VarId
             }
         };
         debug_assert!(range.min <= range.max, "{} <= {}", range.min, range.max);
-        ranges.push(range);
+        ranges[i] = range;
     }
     replacements
 }
 
-fn apply_replacements(instrs: &mut [Instr], replacements: &HashMap<VarId, VarId>) {
+fn apply_replacements(instrs: &mut [Instr], replacements: &[VarId]) {
     for instr in instrs.iter_mut() {
         match instr {
             Instr::Unary { operand, .. } => {
-                *operand = replacements.get(operand).copied().unwrap_or(*operand);
+                *operand = replacements[operand.0 as usize];
             }
             Instr::Binary { lhs, rhs, .. } => {
-                *lhs = replacements.get(lhs).copied().unwrap_or(*lhs);
-                *rhs = replacements.get(rhs).copied().unwrap_or(*rhs);
+                *lhs = replacements[lhs.0 as usize];
+                *rhs = replacements[rhs.0 as usize];
             }
             _ => (),
         }
     }
 }
 
-fn cleanup_unused(instrs: Vec<Instr>) -> Vec<Instr> {
+fn cleanup_unused(mut instrs: Vec<Instr>) -> Vec<Instr> {
     let mut is_used = vec![false; instrs.len()];
     *is_used.last_mut().unwrap() = true;
     for (i, instr) in instrs.iter().enumerate().rev() {
@@ -129,40 +126,37 @@ fn cleanup_unused(instrs: Vec<Instr>) -> Vec<Instr> {
         }
     }
 
-    let mut ids = Vec::with_capacity(instrs.len());
+    let mut ids = vec![VarId(0); instrs.len()];
 
     let mut retained = 0u32;
-    instrs
-        .into_iter()
-        .zip(is_used)
-        .filter_map(|(mut instr, is_used)| {
-            ids.push(VarId(retained));
-            if !is_used {
-                return None;
-            }
+    let mut i = 0;
+    instrs.retain_mut(|mut instr| {
+        ids[i] = VarId(retained);
+        if !is_used[i] {
+            i += 1;
+            return false;
+        }
 
-            match &mut instr {
-                Instr::Unary { operand, .. } => {
-                    *operand = ids[operand.0 as usize];
-                }
-                Instr::Binary { lhs, rhs, .. } => {
-                    *lhs = ids[lhs.0 as usize];
-                    *rhs = ids[rhs.0 as usize];
-                }
-                _ => (),
-            };
-            retained += 1;
-            Some(instr)
-        })
-        .collect()
+        match &mut instr {
+            Instr::Unary { operand, .. } => {
+                *operand = ids[operand.0 as usize];
+            }
+            Instr::Binary { lhs, rhs, .. } => {
+                *lhs = ids[lhs.0 as usize];
+                *rhs = ids[rhs.0 as usize];
+            }
+            _ => (),
+        };
+        retained += 1;
+        i += 1;
+        true
+    });
+    instrs
 }
 
 pub fn specialize(mut instrs: Vec<Instr>, param_ranges: &[Range]) -> Vec<Instr> {
     let replacements = range_optimization(param_ranges, &instrs);
-    let old_last = VarId(instrs.len() as u32 - 1);
-    if let Some(last) = replacements.get(&old_last) {
-        instrs.truncate(last.0 as usize + 1)
-    }
+    instrs.truncate(replacements.last().unwrap().0 as usize + 1);
     apply_replacements(&mut instrs, &replacements);
     cleanup_unused(instrs)
 }

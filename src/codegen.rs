@@ -303,6 +303,16 @@ impl RegisterAllocator {
                         buf.xor(scratch, scratch, Operand::Reg(scratch));
                         buf.sub(dest, scratch, x);
                     }
+                    UnaryOpcode::Square => {
+                        let x = match x {
+                            Operand::Reg(reg) => reg,
+                            mem @ Operand::Memory { .. } => {
+                                buf.mov(Operand::Reg(CodeBuffer::SCRATCH), mem);
+                                CodeBuffer::SCRATCH
+                            }
+                        };
+                        buf.mul(dest, x, Operand::Reg(x))
+                    }
                     UnaryOpcode::Sqrt => buf.sqrt(dest, x),
                 }
             }

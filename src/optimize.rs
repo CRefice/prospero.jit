@@ -24,15 +24,25 @@ fn range_optimization(param_ranges: &[Range], instrs: &[Instr]) -> HashMap<VarId
             Instr::Const(c) => Range { min: *c, max: *c },
             Instr::Unary { op, operand } => {
                 let range = &ranges[operand.0 as usize];
+                use UnaryOpcode::*;
                 match op {
-                    UnaryOpcode::Neg => Range {
+                    Neg => Range {
                         max: -range.min,
                         min: -range.max,
                     },
-                    UnaryOpcode::Sqrt => Range {
+                    Sqrt => Range {
                         min: range.min.max(0.0).sqrt(),
                         max: range.max.sqrt(),
                     },
+                    Square => {
+                        let min = if range.min <= 0.0 && range.max >= 0.0 {
+                            0.0
+                        } else {
+                            f32::min(range.min * range.min, range.max * range.max)
+                        };
+                        let max = f32::max(range.min * range.min, range.max * range.max);
+                        Range { min, max }
+                    }
                 }
             }
             Instr::Binary { op, lhs, rhs } => {
@@ -48,15 +58,6 @@ fn range_optimization(param_ranges: &[Range], instrs: &[Instr]) -> HashMap<VarId
                         min: xr.min - yr.max,
                         max: xr.max - yr.min,
                     },
-                    Mul if lhs == rhs => {
-                        let min = if xr.min <= 0.0 && xr.max >= 0.0 {
-                            0.0
-                        } else {
-                            f32::min(xr.min * xr.min, xr.max * xr.max)
-                        };
-                        let max = f32::max(xr.min * xr.min, xr.max * xr.max);
-                        Range { min, max }
-                    }
                     Mul => range_for(&[
                         xr.min * yr.min,
                         xr.min * yr.max,

@@ -27,6 +27,7 @@ impl VarId {
 #[derive(Debug, Clone, Copy)]
 enum UnaryOpcode {
     Neg,
+    Square,
     Sqrt,
 }
 
@@ -39,7 +40,7 @@ enum BinaryOpcode {
     Min,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 enum Instr {
     Var(u32),
     Const(f32),
@@ -52,35 +53,6 @@ enum Instr {
         lhs: VarId,
         rhs: VarId,
     },
-}
-
-impl std::fmt::Debug for Instr {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Instr::Var(i) => write!(f, "var-{}", i),
-            Instr::Const(x) => write!(f, "const {}", x),
-            Instr::Unary { op, operand } => {
-                let op = match op {
-                    UnaryOpcode::Neg => "neg",
-                    UnaryOpcode::Sqrt => "sqrt",
-                };
-                write!(f, "{} {}", op, operand.0)
-            }
-            Instr::Binary { op, lhs, rhs } => {
-                let op = match op {
-                    BinaryOpcode::Mul if lhs == rhs => {
-                        return write!(f, "square {}", lhs.0);
-                    }
-                    BinaryOpcode::Add => "add",
-                    BinaryOpcode::Sub => "sub",
-                    BinaryOpcode::Mul => "mul",
-                    BinaryOpcode::Max => "max",
-                    BinaryOpcode::Min => "min",
-                };
-                write!(f, "{} {} {}", op, lhs.0, rhs.0)
-            }
-        }
-    }
 }
 
 impl Instr {
@@ -105,10 +77,9 @@ impl Instr {
             }
             "square" => {
                 let operand = VarId::parse(it.next().expect("Operand must be present"));
-                Instr::Binary {
-                    op: BinaryOpcode::Mul,
-                    lhs: operand,
-                    rhs: operand,
+                Instr::Unary {
+                    op: UnaryOpcode::Square,
+                    operand,
                 }
             }
             "sqrt" => {

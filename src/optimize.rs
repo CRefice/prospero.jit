@@ -12,7 +12,7 @@ fn range_for(elems: &[f32]) -> Range {
     Range { min, max }
 }
 
-fn range_optimization(param_ranges: &[Range], instrs: &[Instr]) -> Vec<VarId> {
+fn range_optimization(param_ranges: &[Range], instrs: &[Instr]) -> (Vec<VarId>, Range) {
     let mut ranges: Vec<Range> = vec![Default::default(); instrs.len()];
     let mut replacements: Vec<VarId> = (0..(instrs.len() as u32)).map(VarId).collect();
     for (i, instr) in instrs.iter().enumerate() {
@@ -99,7 +99,7 @@ fn range_optimization(param_ranges: &[Range], instrs: &[Instr]) -> Vec<VarId> {
         debug_assert!(range.min <= range.max, "{} <= {}", range.min, range.max);
         ranges[i] = range;
     }
-    replacements
+    (replacements, *ranges.last().unwrap())
 }
 
 fn apply_replacements(instrs: &mut [Instr], replacements: &[VarId]) {
@@ -155,7 +155,13 @@ fn cleanup_unused(mut instrs: Vec<Instr>) -> Vec<Instr> {
 }
 
 pub fn specialize(mut instrs: Vec<Instr>, param_ranges: &[Range]) -> Vec<Instr> {
-    let replacements = range_optimization(param_ranges, &instrs);
+    let (replacements, range) = range_optimization(param_ranges, &instrs);
+    if range.min >= 0.0 {
+        return vec![Instr::Const(1.0)];
+    }
+    if range.max < 0.0 {
+        return vec![Instr::Const(-1.0)];
+    }
     instrs.truncate(replacements.last().unwrap().0 as usize + 1);
     apply_replacements(&mut instrs, &replacements);
     cleanup_unused(instrs)

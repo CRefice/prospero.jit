@@ -193,9 +193,9 @@ fn main() {
     fn to_image_bytes(x: Ymm) -> [u8; 8] {
         unsafe {
             let mask = _mm256_cmp_ps::<_CMP_LT_OQ>(x, _mm256_setzero_ps());
-            let ones = _mm256_set1_ps(255.0);
-            let result = _mm256_and_ps(mask, ones);
-            let result = _mm256_cvtps_epi32(result);
+            let mask: __m256i = std::mem::transmute(mask);
+            let ones = _mm256_set1_epi32(255);
+            let result = _mm256_and_si256(mask, ones);
             let result = _mm256_packus_epi32(result, result);
             let result = _mm256_packus_epi16(result, result);
             let result =

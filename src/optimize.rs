@@ -166,3 +166,91 @@ pub fn specialize(mut instrs: Vec<Instr>, param_ranges: &[Range]) -> Vec<Instr> 
     apply_replacements(&mut instrs, &replacements);
     cleanup_unused(instrs)
 }
+
+pub fn recursive_specialize(instrs: Vec<Instr>, num_splits: usize) -> Vec<Vec<Vec<Instr>>> {
+    let range = Range {
+        min: -1.0,
+        max: 1.0,
+    };
+    let mut ret = vec![vec![Vec::new(); num_splits]; num_splits];
+    recursive_specialize_mut(instrs, true, (0, 0), [range, range], num_splits, &mut ret);
+    ret
+}
+
+pub fn recursive_specialize_mut(
+    instrs: Vec<Instr>,
+    horizontal_split: bool,
+    (y, x): (usize, usize),
+    ranges: [Range; 2],
+    num_splits: usize,
+    ret: &mut Vec<Vec<Vec<Instr>>>,
+) {
+    if num_splits == 1 {
+        ret[y][x] = instrs;
+        return;
+    }
+
+    if horizontal_split {
+        let range = &ranges[1];
+        let mid = range.min.midpoint(range.max);
+        let bottom = Range {
+            min: range.min,
+            max: mid,
+        };
+        let bottom_ranges = [ranges[0], bottom];
+        let top = Range {
+            min: mid,
+            max: range.max,
+        };
+        let top_ranges = [ranges[0], top];
+        let bottom = specialize(instrs.clone(), &bottom_ranges);
+        let top = specialize(instrs, &top_ranges);
+        recursive_specialize_mut(
+            bottom,
+            !horizontal_split,
+            (y * 2 + 1, x),
+            bottom_ranges,
+            num_splits,
+            ret,
+        );
+        recursive_specialize_mut(
+            top,
+            !horizontal_split,
+            (y * 2, x),
+            top_ranges,
+            num_splits,
+            ret,
+        );
+    } else {
+        let range = &ranges[0];
+        let mid = range.min.midpoint(range.max);
+        let left = Range {
+            min: range.min,
+            max: mid,
+        };
+        let left_ranges = [left, ranges[1]];
+        let right = Range {
+            min: mid,
+            max: range.max,
+        };
+        let right_ranges = [right, ranges[1]];
+        let left = specialize(instrs.clone(), &left_ranges);
+        let right = specialize(instrs, &right_ranges);
+        recursive_specialize_mut(
+            left,
+            !horizontal_split,
+            (y, x * 2),
+            left_ranges,
+            num_splits / 2,
+            ret,
+        );
+        recursive_specialize_mut(
+            right,
+            !horizontal_split,
+            (y, x * 2 + 1),
+            right_ranges,
+            num_splits / 2,
+            ret,
+        );
+    }
+}

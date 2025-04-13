@@ -4,8 +4,8 @@ compile_error!("AVX is required for this project");
 mod codegen;
 mod optimize;
 
-use codegen::{CodeBuffer, Ymm};
-use optimize::{Range, specialize};
+use codegen::Ymm;
+use optimize::recursive_specialize;
 
 use std::fs::File;
 use std::io::BufReader;
@@ -149,31 +149,9 @@ fn main() {
         .collect::<Vec<_>>();
     eprintln!("Parsed code in: {:?}", timer.elapsed());
 
-    let ranges = (0..num_splits)
-        .map(|i| {
-            let size = 2.0 / num_splits as f32;
-            let min = i as f32 * size - 1.0;
-            let max = min + size;
-            Range { min, max }
-        })
-        .collect::<Vec<_>>();
-
     let timer = Instant::now();
-    let specialized: Vec<Vec<codegen::InstalledCode>> = ranges
-        .iter()
-        .rev()
-        .map(|y| {
-            ranges
-                .iter()
-                .map(|x| {
-                    let instrs = specialize(instrs.clone(), &[*x, *y]);
-                    let mut buf = CodeBuffer::default();
-                    codegen::generate_code(&mut buf, &instrs);
-                    buf.install()
-                })
-                .collect()
-        })
-        .collect();
+    let specialized = recursive_specialize(instrs, num_splits);
+
     eprintln!("Compiled code in: {:?}", timer.elapsed());
 
     fn to_unit_rect(i: usize, image_size: usize) -> f32 {
@@ -228,7 +206,8 @@ fn main() {
                 &specialized[(thread * blocks_per_thread)..((thread + 1) * blocks_per_thread)];
             s.spawn(move || {
                 for (row, y) in block.iter().zip((thread * blocks_per_thread)..) {
-                    for (x, code) in row.iter().enumerate() {
+                    for (x, instrs) in row.iter().enumerate() {
+                        let code = codegen::compile(instrs);
                         let start_y = y * block_size;
                         let end_y = start_y + block_size;
                         let start_x = x * block_size;

@@ -386,8 +386,14 @@ impl RegisterAllocator {
     }
 }
 
-pub fn generate_code(buf: &mut CodeBuffer, instrs: &[Instr]) {
+fn generate_code(buf: &mut CodeBuffer, instrs: &[Instr]) {
     RegisterAllocator::new(instrs).generate_code(buf, instrs);
+}
+
+pub fn compile(instrs: &[Instr]) -> InstalledCode {
+    let mut buf = CodeBuffer::default();
+    generate_code(&mut buf, &instrs);
+    buf.install()
 }
 
 pub struct InstalledCode {

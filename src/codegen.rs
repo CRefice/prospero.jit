@@ -413,6 +413,7 @@ impl Drop for InstalledCode {
 }
 
 unsafe impl Send for InstalledCode {}
+unsafe impl Sync for InstalledCode {}
 
 impl InstalledCode {
     pub fn _code(&self) -> &[u8] {

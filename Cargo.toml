@@ -3,6 +3,10 @@ name = "prospero"
 version = "0.1.0"
 edition = "2024"
 
+[profile.rel-with-debinfo]
+inherits = "release"
+debug = true
+
 [dependencies]
 image = {version = "0.25.6", default-features = false, features = ["png"]}
 libc = "0.2.171"

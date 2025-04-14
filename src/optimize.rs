@@ -190,6 +190,17 @@ pub fn recursive_specialize_mut(
         return;
     }
 
+    if instrs.len() == 1 && horizontal_split {
+        for dy in 0..num_splits {
+            let y = y * num_splits + dy;
+            for dx in 0..num_splits {
+                let x = x * num_splits + dx;
+                ret[y][x] = instrs.clone();
+            }
+        }
+        return;
+    }
+
     if horizontal_split {
         let range = &ranges[1];
         let mid = range.min.midpoint(range.max);

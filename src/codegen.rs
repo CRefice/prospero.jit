@@ -24,7 +24,15 @@ pub struct CodeBuffer {
     stack_size: u32,
 }
 
+/// Offset into code buffer
+#[derive(Clone, Copy)]
+pub struct EntryPoint(usize);
+
 impl CodeBuffer {
+    pub fn entrypoint(&self) -> EntryPoint {
+        EntryPoint(self.code.len())
+    }
+
     fn append(&mut self, byte: u8) {
         self.code.push(byte);
     }
@@ -382,18 +390,12 @@ impl RegisterAllocator {
         self.instruction(buf, last, 0);
         buf.ret();
 
-        buf.stack_size = self.stack_size;
+        buf.stack_size = buf.stack_size.max(self.stack_size);
     }
 }
 
-fn generate_code(buf: &mut CodeBuffer, instrs: &[Instr]) {
+pub fn generate_code(buf: &mut CodeBuffer, instrs: &[Instr]) {
     RegisterAllocator::new(instrs).generate_code(buf, instrs);
-}
-
-pub fn compile(instrs: &[Instr]) -> InstalledCode {
-    let mut buf = CodeBuffer::default();
-    generate_code(&mut buf, &instrs);
-    buf.install()
 }
 
 pub struct InstalledCode {
@@ -435,9 +437,9 @@ impl InstalledCode {
 pub type Ymm = std::arch::x86_64::__m256;
 
 impl InstalledCode {
-    pub fn invoke(&self, x: Ymm, y: Ymm, temp: &mut [Ymm]) -> Ymm {
+    pub fn invoke(&self, EntryPoint(offset): EntryPoint, x: Ymm, y: Ymm, temp: &mut [Ymm]) -> Ymm {
         unsafe {
-            let fn_ptr = self.code_buf;
+            let fn_ptr = self.code_buf.add(offset);
             let result: Ymm;
             std::arch::asm!(
                 "call {}",

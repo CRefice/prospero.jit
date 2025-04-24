@@ -1,11 +1,9 @@
 #[cfg(not(target_feature = "avx"))]
 compile_error!("AVX is required for this project");
 
-mod codegen;
-mod optimize;
-
-use codegen::{CodeBuffer, EntryPoint, Ymm};
-use optimize::recursive_specialize;
+use prospero::Instr;
+use prospero::codegen::{self, CodeBuffer, EntryPoint, Ymm};
+use prospero::optimize::recursive_specialize;
 
 use std::arch::x86_64::*;
 use std::fs::File;
@@ -13,113 +11,6 @@ use std::io::BufReader;
 use std::io::prelude::*;
 use std::path::Path;
 use std::time::Instant;
-
-#[derive(Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Clone, Copy, Default)]
-pub struct VarId(u32);
-
-impl VarId {
-    fn parse(label: &str) -> Self {
-        debug_assert!(label.starts_with('_'), "Must start with _: {}", label);
-        let id = u32::from_str_radix(&label[1..], 16).expect("Could not parse label");
-        VarId(id)
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-enum UnaryOpcode {
-    Neg,
-    Square,
-    Sqrt,
-}
-
-#[derive(Debug, Clone, Copy)]
-enum BinaryOpcode {
-    Add,
-    Sub,
-    Mul,
-    Max,
-    Min,
-}
-
-#[derive(Debug, Clone)]
-enum Instr {
-    Var(u32),
-    Const(f32),
-    Unary {
-        op: UnaryOpcode,
-        operand: VarId,
-    },
-    Binary {
-        op: BinaryOpcode,
-        lhs: VarId,
-        rhs: VarId,
-    },
-}
-
-impl Instr {
-    fn parse<'a>(mut it: impl Iterator<Item = &'a str>) -> Self {
-        match it.next().expect("Opcode must be present") {
-            "var-x" => Instr::Var(0),
-            "var-y" => Instr::Var(1),
-            "const" => {
-                let cnst = it.next().expect("Constant value must be present");
-                let cnst = cnst
-                    .parse::<f32>()
-                    .expect("Could not parse f32 from string");
-
-                Instr::Const(cnst)
-            }
-            "neg" => {
-                let operand = VarId::parse(it.next().expect("Operand must be present"));
-                Instr::Unary {
-                    op: UnaryOpcode::Neg,
-                    operand,
-                }
-            }
-            "square" => {
-                let operand = VarId::parse(it.next().expect("Operand must be present"));
-                Instr::Unary {
-                    op: UnaryOpcode::Square,
-                    operand,
-                }
-            }
-            "sqrt" => {
-                let operand = VarId::parse(it.next().expect("Operand must be present"));
-                Instr::Unary {
-                    op: UnaryOpcode::Sqrt,
-                    operand,
-                }
-            }
-            x => {
-                let lhs = VarId::parse(it.next().expect("Left operand must be present"));
-                let rhs = VarId::parse(it.next().expect("Right operand must be present"));
-                use BinaryOpcode::*;
-                let op = match x {
-                    "add" => Add,
-                    "sub" => Sub,
-                    "mul" => Mul,
-                    "max" => Max,
-                    "min" => Min,
-                    x => panic!("Unexpected opcode: {}", x),
-                };
-                Instr::Binary { op, lhs, rhs }
-            }
-        }
-    }
-
-    fn traverse_inputs(&self, mut f: impl FnMut(VarId)) {
-        match self {
-            Instr::Binary { lhs, rhs, .. } => {
-                f(*lhs);
-                f(*rhs);
-            }
-            Instr::Unary { operand, .. } => {
-                f(*operand);
-            }
-            _ => (),
-        }
-    }
-}
 
 fn to_unit_rect(i: usize, image_size: usize) -> f32 {
     let i = i as isize;
